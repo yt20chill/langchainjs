@@ -2308,6 +2308,48 @@ test("Runnable streamEvents method should respect passed signal", async () => {
   }).rejects.toThrowError();
 });
 
+test("Runnable streamEvents method should respect timeout in v2", async () => {
+  const slowRunnable = RunnableLambda.from(
+    async (input: string, config?: { signal?: AbortSignal }) =>
+      new Promise<string>((resolve, reject) => {
+        const signal = config?.signal;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const onAbort = () => {
+          cleanup();
+          reject(signal?.reason ?? new Error("aborted"));
+        };
+        const cleanup = () => {
+          if (timer) {
+            clearTimeout(timer);
+          }
+          signal?.removeEventListener("abort", onAbort);
+        };
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        signal?.addEventListener("abort", onAbort, { once: true });
+
+        // Delay long enough so timeout-based cancellation must trigger.
+        timer = setTimeout(() => {
+          cleanup();
+          resolve(`done: ${input}`);
+        }, 2000);
+      })
+  );
+
+  const eventStream = slowRunnable.streamEvents("hello", {
+    version: "v2",
+    timeout: 100,
+  });
+
+  await expect(async () => {
+    for await (const _ of eventStream) {
+      // Consume until completion or timeout.
+    }
+  }).rejects.toThrowError();
+});
+
 test("streamEvents method handles errors", async () => {
   let caughtError: unknown;
   const model = new FakeListChatModel({

@@ -1,23 +1,16 @@
-import { z } from "zod/v3";
 import { v7 as uuidv7 } from "uuid";
+import { z } from "zod/v3";
 
 import {
   type TraceableFunction,
   isTraceableFunction,
 } from "langsmith/singletons/traceable";
-import type {
-  RunnableInterface,
-  RunnableBatchOptions,
-  RunnableConfig,
-} from "./types.js";
 import { CallbackManagerForChainRun } from "../callbacks/manager.js";
-import {
-  LogStreamCallbackHandler,
-  LogStreamCallbackHandlerInput,
-  RunLog,
-  RunLogPatch,
-  isLogStreamHandler,
-} from "../tracers/log_stream.js";
+import { Serializable } from "../load/serializable.js";
+import { ToolCall } from "../messages/tool.js";
+import { AsyncLocalStorageProviderSingleton } from "../singletons/index.js";
+import { ToolInputParsingException, _isToolCall } from "../tools/utils.js";
+import { Run } from "../tracers/base.js";
 import {
   EventStreamCallbackHandler,
   EventStreamCallbackHandlerInput,
@@ -25,16 +18,31 @@ import {
   StreamEventData,
   isStreamEventsHandler,
 } from "../tracers/event_stream.js";
-import { Serializable } from "../load/serializable.js";
-import pRetry from "../utils/p-retry/index.js";
 import {
-  IterableReadableStream,
-  concat,
-  atee,
-  pipeGeneratorWithSetup,
+  LogStreamCallbackHandler,
+  LogStreamCallbackHandlerInput,
+  RunLog,
+  RunLogPatch,
+  isLogStreamHandler,
+} from "../tracers/log_stream.js";
+import { RootListenersTracer } from "../tracers/root_listener.js";
+import { AsyncCaller } from "../utils/async_caller.js";
+import pRetry from "../utils/p-retry/index.js";
+import { getAbortSignalError, raceWithSignal } from "../utils/signal.js";
+import {
   AsyncGeneratorWithSetup,
+  IterableReadableStream,
+  atee,
+  concat,
+  pipeGeneratorWithSetup,
 } from "../utils/stream.js";
-import { raceWithSignal, getAbortSignalError } from "../utils/signal.js";
+import {
+  InferInteropZodOutput,
+  InteropZodType,
+  getSchemaDescription,
+  interopParseAsync,
+  isSimpleStringZodSchema,
+} from "../utils/types/zod.js";
 import {
   DEFAULT_RECURSION_LIMIT,
   ensureConfig,
@@ -43,13 +51,7 @@ import {
   patchConfig,
   pickRunnableConfigKeys,
 } from "./config.js";
-import { AsyncCaller } from "../utils/async_caller.js";
-import { Run } from "../tracers/base.js";
-import { RootListenersTracer } from "../tracers/root_listener.js";
-import { _RootEventFilter, isRunnableInterface } from "./utils.js";
-import { AsyncLocalStorageProviderSingleton } from "../singletons/index.js";
 import { Graph } from "./graph.js";
-import { convertToHttpEventStream } from "./wrappers.js";
 import {
   consumeAsyncIterableInContext,
   consumeIteratorInContext,
@@ -57,17 +59,15 @@ import {
   isIterableIterator,
   isIterator,
 } from "./iter.js";
-import { _isToolCall, ToolInputParsingException } from "../tools/utils.js";
-import { ToolCall } from "../messages/tool.js";
-import {
-  getSchemaDescription,
-  InferInteropZodOutput,
-  interopParseAsync,
-  InteropZodType,
-  isSimpleStringZodSchema,
-} from "../utils/types/zod.js";
+import type {
+  RunnableBatchOptions,
+  RunnableConfig,
+  RunnableInterface,
+} from "./types.js";
+import { _RootEventFilter, isRunnableInterface } from "./utils.js";
+import { convertToHttpEventStream } from "./wrappers.js";
 
-export { type RunnableInterface, RunnableBatchOptions };
+export { RunnableBatchOptions, type RunnableInterface };
 
 export type RunnableFunc<
   RunInput,
@@ -122,12 +122,12 @@ export function _coerceToDict(value: any, defaultKey: string) {
  * transformed.
  */
 export abstract class Runnable<
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  RunInput = any,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  RunOutput = any,
-  CallOptions extends RunnableConfig = RunnableConfig,
->
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    RunInput = any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    RunOutput = any,
+    CallOptions extends RunnableConfig = RunnableConfig,
+  >
   extends Serializable
   implements RunnableInterface<RunInput, RunOutput, CallOptions>
 {
@@ -917,26 +917,27 @@ export abstract class Runnable<
     async function consumeRunnableStream() {
       let signal;
       let listener: (() => void) | null = null;
+      const parentSignal = config.signal;
 
       try {
-        if (options?.signal) {
+        if (parentSignal) {
           if ("any" in AbortSignal) {
             // Use native AbortSignal.any() if available (Node 19+)
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             signal = (AbortSignal as any).any([
               abortController.signal,
-              options.signal,
+              parentSignal,
             ]);
           } else {
             // Fallback for Node 18 and below - just use the provided signal
-            signal = options.signal;
+            signal = parentSignal;
             // Ensure we still abort our controller when the parent signal aborts
 
             listener = () => {
               abortController.abort();
             };
 
-            options.signal.addEventListener("abort", listener, { once: true });
+            parentSignal.addEventListener("abort", listener, { once: true });
           }
         } else {
           signal = abortController.signal;
@@ -3130,12 +3131,12 @@ export interface RunnableAssignFields<RunInput> {
  * ```
  */
 export class RunnableAssign<
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  RunInput extends Record<string, any> = Record<string, any>,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  RunOutput extends Record<string, any> = Record<string, any>,
-  CallOptions extends RunnableConfig = RunnableConfig,
->
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    RunInput extends Record<string, any> = Record<string, any>,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    RunOutput extends Record<string, any> = Record<string, any>,
+    CallOptions extends RunnableConfig = RunnableConfig,
+  >
   extends Runnable<RunInput, RunOutput>
   implements RunnableAssignFields<RunInput>
 {
@@ -3265,12 +3266,12 @@ export interface RunnablePickFields {
  * ```
  */
 export class RunnablePick<
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  RunInput extends Record<string, any> = Record<string, any>,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  RunOutput extends Record<string, any> | any = Record<string, any> | any,
-  CallOptions extends RunnableConfig = RunnableConfig,
->
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    RunInput extends Record<string, any> = Record<string, any>,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    RunOutput extends Record<string, any> | any = Record<string, any> | any,
+    CallOptions extends RunnableConfig = RunnableConfig,
+  >
   extends Runnable<RunInput, RunOutput>
   implements RunnablePickFields
 {
@@ -3356,9 +3357,9 @@ export interface RunnableToolLikeArgs<
   RunInput extends InteropZodType = InteropZodType,
   RunOutput = unknown,
 > extends Omit<
-  RunnableBindingArgs<InferInteropZodOutput<RunInput>, RunOutput>,
-  "config"
-> {
+    RunnableBindingArgs<InferInteropZodOutput<RunInput>, RunOutput>,
+    "config"
+  > {
   name: string;
 
   description?: string;
